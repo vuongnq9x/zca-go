@@ -65,6 +65,9 @@ func addReactionParseInt(s string) any {
 
 // AddReaction reacts to a message.
 func (a *API) AddReaction(ctx context.Context, icon AddReactionIcon, dest AddReactionDestination) (*AddReactionResponse, error) {
+	if dest.Type != ThreadTypeUser && dest.Type != ThreadTypeGroup {
+		return nil, newError("Thread type is invalid")
+	}
 	if icon == nil {
 		return nil, newError("Invalid reaction")
 	}
@@ -82,10 +85,12 @@ func (a *API) AddReaction(ctx context.Context, icon AddReactionIcon, dest AddRea
 	params := map[string]any{
 		"react_list": []map[string]any{{"message": msg, "clientId": nowMs()}},
 	}
-	u := a.svc("reaction") + "/api/message/reaction"
-	if dest.Type == ThreadTypeUser {
+	var u string
+	switch dest.Type {
+	case ThreadTypeUser:
+		u = a.svc("reaction") + "/api/message/reaction"
 		params["toid"] = dest.ThreadID
-	} else {
+	case ThreadTypeGroup:
 		u = a.svc("reaction") + "/api/group/reaction"
 		params["grid"] = dest.ThreadID
 		params["imei"] = a.IMEI

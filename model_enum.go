@@ -27,7 +27,7 @@ type AvatarSize int
 const (
 	AvatarSizeSmall AvatarSize = 120
 	// Experimental: use only if you know what you're doing.
-	AvatarSizeMedium AvatarSize = 180
+	AvatarSizeMedium AvatarSize = 160 // zca-js PR #375: 180 -> 160
 	AvatarSizeLarge  AvatarSize = 240
 	// Experimental: use only if you know what you're doing.
 	AvatarSizeExtraLarge AvatarSize = 360
