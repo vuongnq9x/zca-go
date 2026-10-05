@@ -23,3 +23,11 @@ Ví dụ đầy đủ: `examples/echo`. Cookie JSON xuất từ trình duyệt �
   `custom` không cần: dùng `api.MakeURL`, `api.EncodeAES`, `api.Request`, `api.Resolve`.
 - Bỏ `checkUpdate` (kiểm npm). Upload chunk gửi tuần tự thay vì song song.
 - Trường số nhận 0 = dùng mặc định của TS (Go không phân biệt "không truyền").
+
+## Port từ PR upstream chưa merge
+
+- Listener nhận cmd 551 (E2EE 1-1) như 501; nếu nội dung là ciphertext Signal thì không giải mã. Frame cmd lạ log ở mức Debug.
+- `OnUnreadCleared` (cmd 504/524, PR #380): thread được đọc trên thiết bị khác của cùng tài khoản.
+- Listener retry khi đóng bất thường (1006) theo lịch `internal`, xoay vòng endpoint, reset đếm retry khi kết nối lại; `OnReconnecting` báo trước mỗi lần retry (PR #371). `Stop()` huỷ retry đang chờ; lỗi "invalid data length or missing cipher key" chỉ log Debug (PR #303).
+- LoginQR gửi `sec-ch-ua`/`sec-ch-ua-platform` suy ra từ User-Agent (PR #303).
+- `GetGroupChatHistory` dùng `group_cloud_message/api/cm/getrecentv2` và phân trang (PR #370). **Breaking:** bỏ `LastActionID`, `LastActionIDOther`, `More`; thêm `LastMsgID`, `HasMore`, ...

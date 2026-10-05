@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,33 +26,42 @@ const (
 // Listener receives realtime events over Zalo's websocket (zca-js Listener).
 // Set the On* handlers before Start; they run on the listener goroutine.
 type Listener struct {
-	OnConnected         func()
-	OnDisconnected      func(code CloseReason, reason string)
-	OnClosed            func(code CloseReason, reason string)
+	OnConnected    func()
+	OnDisconnected func(code CloseReason, reason string)
+	OnClosed       func(code CloseReason, reason string)
+	// OnReconnecting fires when a retry is scheduled after a close.
+	OnReconnecting      func(code CloseReason)
 	OnError             func(error)
 	OnMessage           func(*Message)
 	OnTyping            func(*Typing)
 	OnOldMessages       func([]*Message, ThreadType)
 	OnSeenMessages      func([]*SeenMessage)
 	OnDeliveredMessages func([]*DeliveredMessage)
-	OnReaction          func(*Reaction)
-	OnOldReactions      func(reactions []*Reaction, isGroup bool)
-	OnUploadAttachment  func(UploadEventData)
-	OnUndo              func(*Undo)
-	OnFriendEvent       func(*FriendEvent)
-	OnGroupEvent        func(*GroupEvent)
-	OnCipherKey         func(key string)
+	// OnUnreadCleared fires when a thread is read on another device of the same account
+	// (cmd 504 user / 524 group), also after SendSeenEvent.
+	OnUnreadCleared    func([]*ClearUnread)
+	OnReaction         func(*Reaction)
+	OnOldReactions     func(reactions []*Reaction, isGroup bool)
+	OnUploadAttachment func(UploadEventData)
+	OnUndo             func(*Undo)
+	OnFriendEvent      func(*FriendEvent)
+	OnGroupEvent       func(*GroupEvent)
+	OnCipherKey        func(key string)
 
 	s           *Session
 	urls        []string
 	rotateCount int
 	retries     map[int]*retryState
+	// internalRetry is the "internal" schedule, used for codes without their own entry (e.g. 1006).
+	internalRetry *retryState
 
-	mu        sync.Mutex
-	conn      *websocket.Conn
-	cipherKey string
-	reqID     int
-	stopPing  chan struct{}
+	mu         sync.Mutex
+	stopped    bool // set by Stop; suppresses reconnects until the next Start
+	retryTimer *time.Timer
+	conn       *websocket.Conn
+	cipherKey  string
+	reqID      int
+	stopPing   chan struct{}
 }
 
 type retryState struct {
@@ -62,10 +72,6 @@ type retryState struct {
 func newListener(s *Session, urls []string) *Listener {
 	l := &Listener{s: s, urls: urls, retries: map[int]*retryState{}}
 	for code, r := range s.Settings.Features.Socket.Retries {
-		var c int
-		if _, err := fmt.Sscan(code, &c); err != nil {
-			continue
-		}
 		st := &retryState{max: r.Max}
 		switch t := r.Times.(type) {
 		case float64:
@@ -77,6 +83,14 @@ func newListener(s *Session, urls []string) *Listener {
 				}
 			}
 		}
+		if code == "internal" {
+			l.internalRetry = st
+			continue
+		}
+		var c int
+		if _, err := fmt.Sscan(code, &c); err != nil {
+			continue
+		}
 		l.retries[c] = st
 	}
 	return l
@@ -87,10 +101,19 @@ func (l *Listener) wsURL() string {
 }
 
 // Start connects the websocket. With retryOnClose, it reconnects on the close codes
-// configured by Zalo (rotating endpoints when asked).
-func (l *Listener) Start(retryOnClose bool) error {
+// configured by Zalo (rotating endpoints when asked), and on abnormal closure (1006)
+// using the "internal" retry schedule. Retry counts reset on every successful connect.
+func (l *Listener) Start(retryOnClose bool) error { return l.start(retryOnClose, false) }
+
+var errListenerStopped = errors.New("listener stopped")
+
+func (l *Listener) start(retryOnClose, isRetry bool) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if isRetry && l.stopped {
+		return errListenerStopped
+	}
+	l.stopped = false
 	if l.conn != nil {
 		return newError("Already started")
 	}
@@ -124,10 +147,15 @@ func (l *Listener) Start(retryOnClose bool) error {
 	return nil
 }
 
-// Stop closes the connection with ManualClosure.
+// Stop closes the connection with ManualClosure and cancels a pending reconnect.
 func (l *Listener) Stop() {
 	l.mu.Lock()
 	conn := l.conn
+	l.stopped = true
+	if l.retryTimer != nil {
+		l.retryTimer.Stop()
+		l.retryTimer = nil
+	}
 	l.mu.Unlock()
 	if conn != nil {
 		conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(int(CloseReasonManualClosure), ""), time.Now().Add(time.Second))
@@ -147,6 +175,7 @@ func (l *Listener) reset() {
 }
 
 func (l *Listener) readLoop(conn *websocket.Conn, retryOnClose bool) {
+	l.resetRetryCount()
 	if l.OnConnected != nil {
 		l.OnConnected()
 	}
@@ -158,6 +187,13 @@ func (l *Listener) readLoop(conn *websocket.Conn, retryOnClose bool) {
 			if errors.As(err, &ce) {
 				code, reason = CloseReason(ce.Code), ce.Text
 			}
+			l.mu.Lock()
+			stopped := l.stopped
+			l.mu.Unlock()
+			if stopped {
+				// Stop() closes the socket locally, so the read error is not a CloseError.
+				code, reason, retryOnClose = CloseReasonManualClosure, "", false
+			}
 			conn.Close()
 			l.onClose(code, reason, retryOnClose)
 			return
@@ -166,6 +202,11 @@ func (l *Listener) readLoop(conn *websocket.Conn, retryOnClose bool) {
 			continue
 		}
 		if err := l.handle(conn, data); err != nil {
+			// Some reaction/system frames are undecryptable; zca-js ignores them.
+			if strings.Contains(err.Error(), "invalid data length or missing cipher key") {
+				l.s.log().Debug("Ignored undecryptable Zalo packet", "err", err)
+				continue
+			}
 			l.emitError(err)
 		}
 	}
@@ -179,15 +220,26 @@ func (l *Listener) onClose(code CloseReason, reason string, retryOnClose bool) {
 	if retryOnClose {
 		if delay, ok := l.canRetry(code); ok {
 			if l.shouldRotate(code) {
-				l.rotateCount++
+				l.rotateCount = (l.rotateCount + 1) % len(l.urls)
 				l.s.log().Debug("Rotating websocket endpoint", "index", l.rotateCount)
 			}
-			time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
-				if err := l.Start(true); err != nil {
+			if l.OnReconnecting != nil {
+				l.OnReconnecting(code)
+			}
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.retryTimer = time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
+				l.mu.Lock()
+				l.retryTimer = nil
+				l.mu.Unlock()
+				err := l.start(true, true)
+				if errors.Is(err, errListenerStopped) {
+					return
+				}
+				if err != nil {
+					// A failed dial is an abnormal closure in zca-js, so it keeps retrying until max.
 					l.emitError(err)
-					if l.OnClosed != nil {
-						l.OnClosed(CloseReasonAbnormalClosure, err.Error())
-					}
+					l.onClose(CloseReasonAbnormalClosure, err.Error(), true)
 				}
 			})
 			return
@@ -198,10 +250,28 @@ func (l *Listener) onClose(code CloseReason, reason string, retryOnClose bool) {
 	}
 }
 
+func (l *Listener) isRetryable(code CloseReason) bool {
+	return code == CloseReasonAbnormalClosure || slices.Contains(l.s.Settings.Features.Socket.CloseAndRetryCodes, int(code))
+}
+
+func (l *Listener) resetRetryCount() {
+	for _, r := range l.retries {
+		r.count = 0
+	}
+	if l.internalRetry != nil {
+		l.internalRetry.count = 0
+	}
+}
+
 func (l *Listener) canRetry(code CloseReason) (int64, bool) {
-	sock := l.s.Settings.Features.Socket
+	if !l.isRetryable(code) {
+		return 0, false
+	}
 	r := l.retries[int(code)]
-	if !slices.Contains(sock.CloseAndRetryCodes, int(code)) || r == nil || r.count >= r.max || len(r.times) == 0 {
+	if r == nil {
+		r = l.internalRetry
+	}
+	if r == nil || r.count >= r.max || len(r.times) == 0 {
 		return 0, false
 	}
 	r.count++
@@ -214,7 +284,7 @@ func (l *Listener) canRetry(code CloseReason) (int64, bool) {
 }
 
 func (l *Listener) shouldRotate(code CloseReason) bool {
-	return slices.Contains(l.s.Settings.Features.Socket.RotateErrorCodes, int(code)) && l.rotateCount < len(l.urls)-1
+	return code == CloseReasonAbnormalClosure || slices.Contains(l.s.Settings.Features.Socket.RotateErrorCodes, int(code))
 }
 
 func (l *Listener) emitError(err error) {
@@ -324,7 +394,9 @@ func (l *Listener) handle(conn *websocket.Conn, data []byte) error {
 			}()
 		}
 
-	case version == 1 && (cmd == 501 || cmd == 521) && subCmd == 0:
+	// 551 = E2EE RECEIVE_ONEONE push (zalo sync-v2-worker SignalCommands.MSG); same msgs shape as 501.
+	// Do not add 552 until a real payload has been seen.
+	case version == 1 && (cmd == 501 || cmd == 521 || cmd == 551) && subCmd == 0:
 		isGroup := cmd == 521
 		var d struct {
 			Msgs      []json.RawMessage `json:"msgs"`
@@ -555,9 +627,38 @@ func (l *Listener) handle(conn *websocket.Conn, data []byte) error {
 			l.OnSeenMessages(seen)
 		}
 
+	case (cmd == 504 || cmd == 524) && subCmd == 0:
+		var d struct {
+			ClearUnreads []TClearUnread `json:"clearUnreads"`
+		}
+		if err := l.decode(&env, &d); err != nil {
+			return err
+		}
+		var out []*ClearUnread
+		for _, c := range d.ClearUnreads {
+			// TODO upstream: only type 0 is a thread read; type 2 comes with idTo "-1".
+			if c.Type != 0 {
+				continue
+			}
+			if cmd == 524 {
+				out = append(out, NewGroupClearUnread(c))
+			} else {
+				out = append(out, NewUserClearUnread(c))
+			}
+		}
+		if len(out) > 0 && l.OnUnreadCleared != nil {
+			l.OnUnreadCleared(out)
+		}
+
 	case version == 1 && cmd == 3000 && subCmd == 0:
 		l.s.log().Error("Another connection is opened, closing this one")
 		conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(int(CloseReasonDuplicateConnection), ""), time.Now().Add(time.Second))
+
+	default:
+		// cmd 1 frames without subCmd 1/key are handled-and-ignored in zca-js too.
+		if cmd != 1 {
+			l.s.log().Debug("zca: unhandled ws cmd", "version", version, "cmd", cmd, "subCmd", subCmd)
+		}
 	}
 	return nil
 }

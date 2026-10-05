@@ -90,7 +90,10 @@ type MessageContent struct {
 	Quote       *SendMessageQuote
 	Mentions    []Mention
 	Attachments []AttachmentSource
-	TTL         int64 // milliseconds
+	// TTL is the time to live in milliseconds.
+	//
+	// Deprecated: Zalo no longer applies it.
+	TTL int64
 }
 
 // clientMessageType is zca-js getClientMessageType.

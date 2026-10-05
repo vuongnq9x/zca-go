@@ -167,13 +167,42 @@ type LoginQRCallback func(LoginQREvent) LoginQRAction
 
 var errQRRetry = errors.New("qr retry")
 
-func qrHeaders(referer string, document bool) http.Header {
+var (
+	reWindowsUA = regexp.MustCompile(`(?i)Windows`)
+	reMacUA     = regexp.MustCompile(`(?i)Macintosh|Mac OS X`)
+	reLinuxUA   = regexp.MustCompile(`(?i)Linux|X11`)
+	reChromeUA  = regexp.MustCompile(`Chrome/(\d+)`)
+)
+
+// platformFromUA derives sec-ch-ua-platform from the User-Agent so client hints match it.
+func platformFromUA(ua string) string {
+	switch {
+	case reWindowsUA.MatchString(ua):
+		return "Windows"
+	case reMacUA.MatchString(ua):
+		return "macOS"
+	case reLinuxUA.MatchString(ua):
+		return "Linux"
+	}
+	return "Windows"
+}
+
+// chromeVersionFromUA returns the Chrome major version in ua, or "130" when absent.
+func chromeVersionFromUA(ua string) string {
+	if m := reChromeUA.FindStringSubmatch(ua); m != nil {
+		return m[1]
+	}
+	return "130"
+}
+
+func qrHeaders(ua, referer string, document bool) http.Header {
+	ver := chromeVersionFromUA(ua)
 	h := http.Header{}
 	h.Set("Accept", "*/*")
 	h.Set("Accept-Language", "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5")
-	h.Set("sec-ch-ua", `"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"`)
+	h.Set("sec-ch-ua", `"Chromium";v="`+ver+`", "Google Chrome";v="`+ver+`", "Not?A_Brand";v="99"`)
 	h.Set("sec-ch-ua-mobile", "?0")
-	h.Set("sec-ch-ua-platform", `"Windows"`)
+	h.Set("sec-ch-ua-platform", `"`+platformFromUA(ua)+`"`)
 	h.Set("sec-fetch-dest", "empty")
 	h.Set("sec-fetch-mode", "cors")
 	h.Set("sec-fetch-site", "same-origin")
@@ -197,7 +226,7 @@ const (
 )
 
 func qrPost(ctx context.Context, s *Session, endpoint, referer string, form url.Values, out any) error {
-	resp, err := s.Request(ctx, http.MethodPost, endpoint, []byte(form.Encode()), qrHeaders(referer, false))
+	resp, err := s.Request(ctx, http.MethodPost, endpoint, []byte(form.Encode()), qrHeaders(s.UserAgent, referer, false))
 	if err != nil {
 		return err
 	}
@@ -230,7 +259,7 @@ var loginVersionRe = regexp.MustCompile(`https://stc-zlogin\.zdn\.vn/main-([\d.]
 func loginQROnce(ctx context.Context, s *Session, qrPath string, cb LoginQRCallback) ([]Cookie, error) {
 	s.jar = &cookieJar{}
 
-	h := qrHeaders("https://chat.zalo.me/", true)
+	h := qrHeaders(s.UserAgent, "https://chat.zalo.me/", true)
 	h.Set("cache-control", "max-age=0")
 	h.Set("sec-fetch-site", "same-site")
 	h.Set("sec-fetch-user", "?1")
@@ -326,7 +355,7 @@ func loginQROnce(ctx context.Context, s *Session, qrPath string, cb LoginQRCallb
 		return nil, newError(fmt.Sprintf("An error has occurred: %d %s", confirm.ErrorCode, confirm.ErrorMessage))
 	}
 
-	ch := qrHeaders(refChat, true)
+	ch := qrHeaders(s.UserAgent, refChat, true)
 	resp, err = s.Request(ctx, http.MethodGet, "https://id.zalo.me/account/checksession?continue=https%3A%2F%2Fchat.zalo.me%2Findex.html", nil, ch)
 	if err != nil {
 		return nil, newError("Cannot get session, login failed")
@@ -334,7 +363,7 @@ func loginQROnce(ctx context.Context, s *Session, qrPath string, cb LoginQRCallb
 	resp.Body.Close()
 	s.log().Info("Successfully logged into the account", "name", scan.Data.DisplayName)
 
-	uh := qrHeaders("https://chat.zalo.me/", false)
+	uh := qrHeaders(s.UserAgent, "https://chat.zalo.me/", false)
 	uh.Set("sec-fetch-site", "same-site")
 	uh.Del("Content-Type")
 	resp, err = s.Request(ctx, http.MethodGet, "https://jr.chat.zalo.me/jr/userinfo", nil, uh)

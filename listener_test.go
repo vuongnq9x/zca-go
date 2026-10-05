@@ -49,4 +49,54 @@ func TestListenerHandle(t *testing.T) {
 	if err := l.handle(nil, wsFrame(602, 0, map[string]any{"data": td, "encrypt": 0})); err != nil || typing == nil || typing.Data.UID != "5" {
 		t.Fatalf("typing = %+v, %v", typing, err)
 	}
+
+	// cmd 551 (E2EE 1-1 push) routes like 501.
+	got = nil
+	if err := l.handle(nil, wsFrame(551, 0, map[string]any{"data": data, "encrypt": 0})); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Type != ThreadTypeUser || got[0].Data.Content != "hi" {
+		t.Fatalf("551 messages = %+v", got)
+	}
+	if err := l.handle(nil, wsFrame(621, 0, map[string]any{})); err != nil {
+		t.Fatalf("unhandled cmd: %v", err)
+	}
+
+	var cleared [][]*ClearUnread
+	l.OnUnreadCleared = func(c []*ClearUnread) { cleared = append(cleared, c) }
+	cu := `{"data":{"clearUnreads":[{"idTo":"123","isGroup":0,"lastMsgId":"77","type":0},{"idTo":"-1","isGroup":0,"lastMsgId":"0","type":2}]}}`
+	l.handle(nil, wsFrame(504, 0, map[string]any{"data": cu, "encrypt": 0}))
+	l.handle(nil, wsFrame(524, 0, map[string]any{"data": cu, "encrypt": 0}))
+	l.handle(nil, wsFrame(504, 0, map[string]any{"data": `{"data":{"clearUnreads":[]}}`, "encrypt": 0}))
+	if len(cleared) != 2 || len(cleared[0]) != 1 || cleared[0][0].Type != ThreadTypeUser || cleared[0][0].ThreadID != "123" ||
+		cleared[0][0].Data.LastMsgID != "77" || cleared[1][0].Type != ThreadTypeGroup {
+		t.Fatalf("cleared = %+v", cleared)
+	}
+}
+
+func TestListenerRetry(t *testing.T) {
+	s := &Session{}
+	s.Settings.Features.Socket.Retries = map[string]struct {
+		Max   int `json:"max"`
+		Times any `json:"times"`
+	}{"internal": {Max: 2, Times: []any{1000.0, 2000.0}}}
+	l := newListener(s, []string{"a", "b"})
+	for _, want := range []int64{1000, 2000} {
+		if d, ok := l.canRetry(CloseReasonAbnormalClosure); !ok || d != want {
+			t.Fatalf("canRetry = %d %v, want %d", d, ok, want)
+		}
+	}
+	if _, ok := l.canRetry(CloseReasonAbnormalClosure); ok {
+		t.Fatal("retry past max")
+	}
+	if _, ok := l.canRetry(CloseReasonManualClosure); ok {
+		t.Fatal("manual closure retried")
+	}
+	if !l.shouldRotate(CloseReasonAbnormalClosure) {
+		t.Fatal("1006 should rotate")
+	}
+	l.resetRetryCount()
+	if _, ok := l.canRetry(CloseReasonAbnormalClosure); !ok {
+		t.Fatal("reset did not restore retries")
+	}
 }
