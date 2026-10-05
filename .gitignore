@@ -1,0 +1,4 @@
+# local login artifacts — contain session cookies
+credentials.json
+qr.png
+/echo
